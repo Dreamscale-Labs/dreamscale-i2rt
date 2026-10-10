@@ -1,3 +1,22 @@
+# dreamscale-i2rt
+
+Dreamscale Labs' maintained build of the [I2RT Python API](https://github.com/i2rt-robotics/i2rt),
+published to PyPI so the YAM driver installs like any other package:
+
+```bash
+pip install dreamscale-i2rt
+```
+
+It installs the same `i2rt` import package, so it replaces an upstream `i2rt` install in the same
+environment rather than sitting beside it. The core install is what YAM arm control needs; the
+Flow Base, gamepad, visualisation, GPIO and script dependencies are extras
+(`flow-base`, `gamepad`, `viz`, `gpio`, `scripts`, or `all`).
+
+This is a fork. I2RT Robotics wrote the original code under the MIT licence; see [LICENSE](LICENSE).
+Releases are tagged `v<version>` and published from [publish.yml](.github/workflows/publish.yml).
+
+---
+
 # I2RT Python API
 
 A Python client library for interacting with [I2RT](https://i2rt.com/) products — designed for learning-based robotics, teleoperation, and real-world deployment.
