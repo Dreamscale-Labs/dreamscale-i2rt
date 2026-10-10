@@ -1,54 +1,71 @@
 [build-system]
-requires = ["flit_core >= 3.4"]
+requires = ["flit_core >=3.12,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "i2rt"
-version = "1.1.2"
+name = "dreamscale-i2rt"
+version = "1.3.6.post1"
+description = "Dreamscale's maintained build of the I2RT YAM arm and Flow Base Python driver."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dynamic = ["description"]
+# The core is what YAM arm control needs: the CAN motor drivers, the robot
+# models and MuJoCo kinematics/gravity compensation. Everything else is an extra.
 dependencies = [
-    "click<8.2.0",
     # crcmod-plus is a maintained fork that installs into the `crcmod` namespace, so code still does `import crcmod`.
     "crcmod-plus>=2.3.1",
-    "dm-env==1.6",
+    "dm-env>=1.6",
+    # i2rt.robots.motor_chain_robot imports the MCAP recorder (i2rt.utils.recording).
     "mcap-ros2-support>=0.5.5",
     "mink>=0.0.13",
     "mujoco>=3.3.5",
-    "numpy==2.2.6",
-    "portal==3.7.3",
+    "numpy>=1.26,<3",
+    "packaging",
     "pydantic>=2.0",
-    "pygame==2.6.1",
-    "python-can==4.5.0",
+    "python-can>=4.5,<5",
     "pyyaml>=6.0.0",
-    "qpsolvers[quadprog]==4.7.1",
-    "rerun-sdk>=0.32.2",
-    "ruckig==0.15.3",
-    "threadpoolctl==3.6.0",
+    "qpsolvers[quadprog]>=4.7.1",
     "tyro>=1.0.0",
+]
+
+[project.optional-dependencies]
+# Flow Base controller (i2rt.flow_base).
+flow-base = [
+    "portal>=3.7.3",
+    "pygame>=2.6.1",
+    "ruckig>=0.15.3",
+    "threadpoolctl>=3.6.0",
+]
+# Gamepad teleoperation (i2rt.utils.gamepad_utils).
+gamepad = ["pygame>=2.6.1"]
+# Browser and recording visualisation (i2rt.utils.viser_control_interface, scripts).
+viz = [
+    "rerun-sdk>=0.32.2",
     "viser>=0.2.0",
-    # USB-to-GPIO converter for the linear-rail brake + limit switches on x86/non-Pi hosts.
+]
+# Linear-rail brake and limit switches (i2rt.utils.usb_gpio_driver).
+gpio = [
+    # USB-to-GPIO converter on x86/non-Pi hosts.
     "pyserial>=3.5",
-    # Raspberry Pi GPIO (linear-rail brake + limit switches). Pi-only via PEP 508 markers.
     # rpi-lgpio is a drop-in for `from RPi import GPIO` that works on Pi 5 (BCM2712);
     # legacy RPi.GPIO fails with "cannot determine peripheral soc base addr" on Pi 5.
     "rpi-lgpio>=0.6; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'armv7l' or platform_machine == 'armv6l')",
 ]
-
-[project.optional-dependencies]
+# The scripts under devices/ and examples/ (not part of the installed package).
+scripts = ["click>=8.0"]
+all = ["dreamscale-i2rt[flow-base,gamepad,viz,gpio,scripts]"]
 dev = [
+    "dreamscale-i2rt[all]",
     "pyright>=1.1.408",
     "pytest>=8.4.0",
     "pytest-xdist>=3.8.0",
     "ruff>=0.15.6",
 ]
 
-[tool.uv]
-# ruckig 0.15.3 publishes only an sdist, so it is compiled from source on a fresh
-# install (e.g. CI). Its build fails under scikit-build-core >= 0.10, which rejects the
-# package's deprecated `cmake.targets`. Pin the build backend below that so it builds.
-build-constraint-dependencies = ["scikit-build-core<0.10"]
+[project.urls]
+Source = "https://github.com/Dreamscale-Labs/dreamscale-i2rt"
+Upstream = "https://github.com/i2rt-robotics/i2rt"
 
 [tool.flit.module]
 name = "i2rt"

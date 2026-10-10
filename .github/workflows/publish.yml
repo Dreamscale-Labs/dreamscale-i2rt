@@ -1,0 +1,70 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Verify the tag matches the package version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$TAG_NAME" = "v$VERSION" || { echo "::error::tag $TAG_NAME does not match v$VERSION"; exit 1; }
+
+      - name: Test against the newest dependencies
+        run: |
+          uv venv /tmp/latest --python 3.12
+          uv pip install --python /tmp/latest/bin/python ".[all]" pytest pytest-xdist
+          /tmp/latest/bin/python -m pytest -q -n auto -p no:cacheprovider i2rt
+
+      - name: Build
+        run: uv build --out-dir dist
+
+      - name: Check metadata
+        run: uvx --from twine twine check --strict dist/*
+
+      - name: Smoke the wheel
+        run: |
+          uv venv /tmp/smoke --python 3.12
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          cd /tmp && /tmp/smoke/bin/python -c "import i2rt.robots.motor_chain_robot; from i2rt.robots.get_robot import get_yam_robot; from i2rt.robots.kinematics import Kinematics; from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: astral-sh/setup-uv@v7
+      - name: Publish with PyPI trusted publishing
+        run: uv publish --check-url https://pypi.org/simple/ dist/*
