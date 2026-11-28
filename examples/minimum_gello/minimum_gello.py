@@ -18,6 +18,8 @@ from i2rt.robots.robot import Robot
 from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml, teaching_handle_trigger_id
 from i2rt.utils.utils import RateRecorder, override_log_level
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_ROBOT_PORT = 11333
 _MAX_DOFS = 16
 """Upper bound on robot DOF. The shared pos array is sized to this; the active
@@ -47,10 +49,18 @@ class ClientRobot(Robot):
         return self._client.get_joint_pos().result()
 
     def command_joint_pos(self, joint_pos: np.ndarray) -> None:
-        self._client.command_joint_pos(joint_pos)
+        # .result() is load-bearing, not just error propagation. portal's client wakes its socket
+        # thread by writing one byte to a signal pipe per request, but drains that pipe only once
+        # per send-queue-emptying (portal/client_socket.py). A fire-and-forget command followed
+        # immediately by another call lands both requests in one send burst: two bytes written, one
+        # drained — a leak that fills the 64 KiB pipe in minutes of teleop, after which send()
+        # blocks forever in os.write and the leader silently stops forwarding commands (confirmed
+        # twice via py-spy: MainThread stuck at client_socket.py send). Waiting for the reply keeps
+        # every request in its own burst, so writes and drains stay exactly balanced.
+        self._client.command_joint_pos(joint_pos).result()
 
     def command_joint_state(self, joint_state: Dict[str, np.ndarray]) -> None:
-        self._client.command_joint_state(joint_state)
+        self._client.command_joint_state(joint_state).result()  # see command_joint_pos for why
 
     def get_observations(self) -> Dict[str, np.ndarray]:
         return self._client.get_observations().result()
@@ -195,7 +205,7 @@ def _yam_polling_worker(
                     pos_shared.array[len(pos)] = float(gripper_pos[0])
             rate.track()
         except Exception as e:
-            logging.error(f"[{rate_name}] error: {e}")
+            logger.error(f"[{rate_name}] error: {e}")
             time.sleep(0.1)
         time.sleep(_WORKER_LOOP_PERIOD_S)  # pace: get_joint_pos is a cached read, so this loop would otherwise spin
 
@@ -219,8 +229,11 @@ def _rpc_polling_worker(
             pos_shared.array[: len(pos)] = pos
             rate.track()
         except Exception as e:
-            logging.error(f"[{rate_name}] error: {e}")
+            logger.error(f"[{rate_name}] error: {e}")
             time.sleep(0.1)
+        # Pace the loop: unbounded RPC deadlocks portal's client the same way as in
+        # _run_leader_io_loop (see the comment there).
+        time.sleep(_WORKER_LOOP_PERIOD_S)
 
 
 def _leader_control_worker(
@@ -261,8 +274,8 @@ def _leader_control_worker(
     else:
         return  # stop requested before the encoder became ready
     current_follower_joint_pos = pos_shared.array.copy()
-    logging.info(f"Current leader joint pos: {current_joint_pos}")
-    logging.info(f"Current follower joint pos: {current_follower_joint_pos}")
+    logger.info(f"Current leader joint pos: {current_joint_pos}")
+    logger.info(f"Current follower joint pos: {current_follower_joint_pos}")
 
     def slow_move(joint_pos: np.ndarray, duration: float = 3.0) -> None:
         start_pos = pos_shared.array.copy()
@@ -283,7 +296,7 @@ def _leader_control_worker(
                 robot.command_joint_pos(current_joint_pos[:6])
                 slow_move(current_joint_pos)
             else:
-                logging.info("clear bilateral pd")
+                logger.info("clear bilateral pd")
                 robot.update_kp_kd(kp=np.ones(6) * 0.0, kd=np.ones(6) * 0.0)
                 current_follower_joint_pos = pos_shared.array.copy()
                 robot.command_joint_pos(current_follower_joint_pos[:6])
@@ -373,7 +386,7 @@ def _build_follower_server(
         return {"joint_pos": _get_pos()}
 
     server = portal.Server(server_port)
-    logging.info(f"Robot Server Binding to {server_port}")
+    logger.info(f"Robot Server Binding to {server_port}")
     server.bind("num_dofs", _tracked(lambda: n_dofs_value.value))
     server.bind("get_joint_pos", _tracked(_get_pos))
     server.bind("command_joint_pos", _tracked(_cmd_pos))
@@ -413,8 +426,15 @@ def _run_leader_io_loop(
             # Ride out a transient follower/network blip. Without this the exception escapes to
             # run_leader, whose finally: cleanup() calls proc.kill() on the control worker while the
             # leader arm is energized in bilateral PD — an abrupt loss of control of a powered arm.
-            logging.error(f"[yam-leader web-port io] error: {e}")
+            logger.error(f"[yam-leader web-port io] error: {e}")
             time.sleep(0.1)
+        # Pace the loop. portal's client wakes its socket thread by writing one byte to a pipe per
+        # request, but that pipe is drained at most one byte per socket-loop iteration and only while
+        # the send queue is empty (portal/client_socket.py: the `if not writing:` guard). Unpaced this
+        # loop issues ~7 kHz of RPCs, the send queue never empties, the 64 KiB pipe fills, and send()
+        # blocks forever in os.write with no timeout — the leader silently stops forwarding commands
+        # while its control worker keeps running. 500 Hz is well clear of the ~250 Hz hardware rate.
+        time.sleep(_WORKER_LOOP_PERIOD_S)
 
 
 def _run_viewer_loop(
@@ -482,14 +502,14 @@ def cleanup(resources: Resources) -> None:
     """Tear down everything accumulated into ``resources``. Mirrors
     xdof/envs/launch.py's ``cleanup``: signal workers to stop, kill their
     processes, then release shared memory."""
-    logging.info("exiting")
+    logger.info("exiting")
     if resources.stop_event is not None:
         resources.stop_event.set()
     for proc in resources.processes:
         proc.kill()
     if resources.pos_shared is not None:
         resources.pos_shared.close()
-    logging.info("Processes terminated.")
+    logger.info("Processes terminated.")
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +545,7 @@ def run_follower(args: Args) -> None:
         )
     )
     n_dofs = _wait_for_dof(n_dofs_value)
-    logging.info(f"Follower YAM ready, num_dofs={n_dofs}")
+    logger.info(f"Follower YAM ready, num_dofs={n_dofs}")
 
     server = _build_follower_server(args.server_port, n_dofs_value, resources.pos_shared, cmd_queue)
 
@@ -534,7 +554,7 @@ def run_follower(args: Args) -> None:
     except KeyboardInterrupt:
         pass
     except Exception:
-        logging.exception("follower mode failed")
+        logger.exception("follower mode failed")
         raise
     finally:
         cleanup(resources)
@@ -543,7 +563,7 @@ def run_follower(args: Args) -> None:
 def run_leader(args: Args) -> None:
     client_robot = ClientRobot(args.server_port, host=args.server_host)
     initial_follower_pos = client_robot.get_joint_pos()
-    logging.info(f"Initial follower joint pos: {initial_follower_pos}")
+    logger.info(f"Initial follower joint pos: {initial_follower_pos}")
 
     resources = Resources(
         pos_shared=portal.SharedArray(shape=(len(initial_follower_pos),), dtype=np.float64),
@@ -571,7 +591,7 @@ def run_leader(args: Args) -> None:
     except KeyboardInterrupt:
         pass
     except Exception:
-        logging.exception("leader mode failed")
+        logger.exception("leader mode failed")
         raise
     finally:
         cleanup(resources)
@@ -601,7 +621,7 @@ def run_visualizer_local(args: Args) -> None:
         )
     )
     n_dofs = _wait_for_dof(n_dofs_value)
-    logging.info(f"Viz YAM ready, num_dofs={n_dofs}")
+    logger.info(f"Viz YAM ready, num_dofs={n_dofs}")
 
     # The teaching handle's trigger is rendered but not commanded, so it sits one slot
     # past the joints (see _yam_polling_worker). For every other gripper that slot is unwritten.
@@ -615,7 +635,7 @@ def run_visualizer_local(args: Args) -> None:
     try:
         _run_viewer_loop(arm_type, gripper_type, get_pos)
     except Exception:
-        logging.exception("visualizer_local mode failed")
+        logger.exception("visualizer_local mode failed")
         raise
     finally:
         cleanup(resources)
@@ -627,7 +647,7 @@ def run_visualizer_remote(args: Args) -> None:
 
     with ClientRobot(args.server_port, host=args.server_host) as bootstrap:
         n_dofs = bootstrap.num_dofs()
-    logging.info(f"Remote follower num_dofs={n_dofs}")
+    logger.info(f"Remote follower num_dofs={n_dofs}")
 
     resources = Resources(
         pos_shared=portal.SharedArray(shape=(_MAX_DOFS,), dtype=np.float64),
@@ -653,7 +673,7 @@ def run_visualizer_remote(args: Args) -> None:
     try:
         _run_viewer_loop(arm_type, gripper_type, get_pos)
     except Exception:
-        logging.exception("visualizer_remote mode failed")
+        logger.exception("visualizer_remote mode failed")
         raise
     finally:
         cleanup(resources)
@@ -665,7 +685,7 @@ def run_visualizer_remote(args: Args) -> None:
 
 
 def main(args: Args) -> None:
-    # Make RateRecorder's logging.info output (and our own logging calls) visible.
+    # Make RateRecorder's INFO output (and our own logging calls) visible.
     override_log_level()
     arm_type = ArmType.from_string_name(args.arm)
 
